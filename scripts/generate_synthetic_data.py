@@ -115,30 +115,30 @@ def health_mult(health: float) -> float:
     return float(np.clip(health, 0.30, 1.50))
 
 
-def months_back(end=SIM_END, n=N_MONTHS):
-    """Ascending list of (year, month) ending at `end`, length n."""
-    y, m = end
-    out = []
-    for _ in range(n):
-        out.append((y, m))
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
-    return list(reversed(out))
+def months_back(end=SIM_END, n_months=N_MONTHS):
+    """Ascending list of (year, month) ending at `end`, length n_months."""
+    year, month = end
+    calendar = []
+    for _ in range(n_months):
+        calendar.append((year, month))
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+    return list(reversed(calendar))
 
 
-def month_str(ym) -> str:
-    return f"{ym[0]:04d}-{ym[1]:02d}"
+def month_str(year_month) -> str:
+    return f"{year_month[0]:04d}-{year_month[1]:02d}"
 
 
-def first_of_month(ym) -> date:
-    return date(ym[0], ym[1], 1)
+def first_of_month(year_month) -> date:
+    return date(year_month[0], year_month[1], 1)
 
 
-def add_months(ym, k):
-    y, m = ym
-    total = (y * 12 + (m - 1)) + k
+def add_months(year_month, offset):
+    year, month = year_month
+    total = (year * 12 + (month - 1)) + offset
     return (total // 12, total % 12 + 1)
 
 
@@ -146,55 +146,54 @@ def add_months(ym, k):
 # Latent + branch generation
 # ----------------------------------------------------------------------------
 
-def gen_health_path(rng, n, start=1.0, zone_anchor=None, anchor_coupling=0.12):
+def gen_health_path(rng, n_months, start=1.0, zone_anchor=None, anchor_coupling=0.12):
     """Random walk with drift; optionally nudged by the zone anchor's health."""
-    h = np.empty(n)
-    h[0] = start
-    for t in range(1, n):
+    health = np.empty(n_months)
+    health[0] = start
+    for month_idx in range(1, n_months):
         step = DRIFT + rng.normal(0.0, WALK_NOISE)
         if zone_anchor is not None:
             # When the anchor is below its own baseline, neighbours feel it.
-            step += anchor_coupling * (zone_anchor[t] - 1.0)
-        h[t] = h[t - 1] + step
-    return h
+            step += anchor_coupling * (zone_anchor[month_idx] - 1.0)
+        health[month_idx] = health[month_idx - 1] + step
+    return health
 
 
 def sample_exit_index(rng, health_path):
     """First month the latent-driven hazard fires, else None (censored/active)."""
-    for t in range(len(health_path)):
-        p = sigmoid(EXIT_BASE + EXIT_K * stress_of(health_path[t]))
-        if rng.random() < p:
-            return t
+    for month_idx in range(len(health_path)):
+        p_exit = sigmoid(EXIT_BASE + EXIT_K * stress_of(health_path[month_idx]))
+        if rng.random() < p_exit:
+            return month_idx
     return None
 
 
 def credit_score(health: float) -> float:
-    """Map latent health to a notional credit score (~300–850)."""
+    """Map latent health to a notional credit score (~300-850)."""
     return 650.0 + 180.0 * (health - 1.0)
 
 
-def build_observations(rng, calendar, health, static):
+def build_observations(rng, calendar, health_path, tenant_static):
     """Compute the four-branch monthly features from the health path."""
-    n = len(calendar)
-    base_psf = static["base_psf"]
-    rent_psf = static["rent_psf"]
-    sqft = static["sqft"]
-    season_amp = static["season_amp"]
-    operator_type = static["operator_type"]
-    zone_anchor = static.get("zone_anchor")
+    base_psf = tenant_static["base_psf"]
+    rent_psf = tenant_static["rent_psf"]
+    sqft = tenant_static["sqft"]
+    season_amp = tenant_static["season_amp"]
+    operator_type = tenant_static["operator_type"]
+    zone_anchor = tenant_static.get("zone_anchor")
 
-    obs = []
-    for t, ym in enumerate(calendar):
-        h = health[t]
-        stress = stress_of(h)
-        season = 1.0 + (SEASON_BY_MONTH[ym[1]] - 1.0) * season_amp
+    observations = []
+    for month_idx, year_month in enumerate(calendar):
+        current_health = health_path[month_idx]
+        stress = stress_of(current_health)
+        season = 1.0 + (SEASON_BY_MONTH[year_month[1]] - 1.0) * season_amp
 
         # Branch 1 — revenue
-        sales_psf = base_psf * health_mult(h) * season
+        sales_psf = base_psf * health_mult(current_health) * season
         sales_total = sales_psf * sqft
         rent_to_sales = (rent_psf * sqft) / sales_total  # == rent_psf / sales_psf
-        anchor_mod = 1.0 if zone_anchor is None else float(np.clip(0.7 + 0.3 * zone_anchor[t], 0.4, 1.2))
-        foot_traffic = static["foot_base"] * season * anchor_mod * (1.0 + rng.normal(0, 0.05))
+        anchor_mod = 1.0 if zone_anchor is None else float(np.clip(0.7 + 0.3 * zone_anchor[month_idx], 0.4, 1.2))
+        foot_traffic = tenant_static["foot_base"] * season * anchor_mod * (1.0 + rng.normal(0, 0.05))
 
         # Branch 2 — operational (landlord-observed)
         late_payment = rng.random() < sigmoid(LATE_INTERCEPT + LATE_SLOPE * stress)
@@ -205,16 +204,16 @@ def build_observations(rng, calendar, health, static):
 
         # Branch 4 — external / third-party
         if operator_type in ("corporate", "franchise"):
-            if t >= 3:
-                raw = (credit_score(health[t]) - credit_score(health[t - 3])) / 100.0
+            if month_idx >= 3:
+                raw_trend = (credit_score(health_path[month_idx]) - credit_score(health_path[month_idx - 3])) / 100.0
             else:
-                raw = 0.0
-            credit_trend = float(np.clip(raw + rng.normal(0, CREDIT_NOISE_CORP), -0.40, 0.40))
+                raw_trend = 0.0
+            credit_trend = float(np.clip(raw_trend + rng.normal(0, CREDIT_NOISE_CORP), -0.40, 0.40))
         else:
             credit_trend = float(rng.normal(0, CREDIT_NOISE_THIN))  # thin file: ~no signal
 
-        obs.append({
-            "month": month_str(ym),
+        observations.append({
+            "month": month_str(year_month),
             "sales_total": round(sales_total, 2),
             "sales_per_sqft": round(sales_psf, 3),
             "foot_traffic_estimate": int(max(0, foot_traffic)),
@@ -225,27 +224,27 @@ def build_observations(rng, calendar, health, static):
             "stock_depth_index": round(stock_depth_index, 3),
             "credit_trend_3mo": round(credit_trend, 4),
         })
-    return obs
+    return observations
 
 
-def inject_enquiries(rng, obs, health, exit_index):
+def inject_enquiries(rng, observations, health_path, exit_index):
     """
     Leading behavioural signal, coupled to CHRONIC stress with a randomised
     lead time — never fired the month before exit (anti-leakage).
     """
-    n = len(obs)
+    n_periods = len(observations)
     if exit_index is not None:
         if rng.random() > ENQUIRY_FALSE_NEG:  # most exiters enquire first
-            lead = int(rng.integers(ENQUIRY_LEAD_MIN, ENQUIRY_LEAD_MAX + 1))
-            idx = exit_index - lead
-            if 0 <= idx < n:
-                obs[idx]["relief_or_exit_enquiry"] = True
+            lead_months = int(rng.integers(ENQUIRY_LEAD_MIN, ENQUIRY_LEAD_MAX + 1))
+            enquiry_idx = exit_index - lead_months
+            if 0 <= enquiry_idx < n_periods:
+                observations[enquiry_idx]["relief_or_exit_enquiry"] = True
     else:
         # False positives: chronically-stressed survivors sometimes enquire.
-        for t in range(6, n):
-            chronic = np.mean([stress_of(health[k]) for k in range(t - 6, t)])
-            if chronic > 0.45 and rng.random() < ENQUIRY_FALSE_POS_RATE * (1 + chronic):
-                obs[t]["relief_or_exit_enquiry"] = True
+        for month_idx in range(6, n_periods):
+            chronic_stress = np.mean([stress_of(health_path[m]) for m in range(month_idx - 6, month_idx)])
+            if chronic_stress > 0.45 and rng.random() < ENQUIRY_FALSE_POS_RATE * (1 + chronic_stress):
+                observations[month_idx]["relief_or_exit_enquiry"] = True
 
 
 # ----------------------------------------------------------------------------
@@ -266,17 +265,17 @@ def sample_risk_appetite(rng, category, operator_type):
         base["bold"] += 0.10
         base["cautious"] -= 0.10
     # renormalise (guard against tiny negatives)
-    base = {k: max(0.01, v) for k, v in base.items()}
-    tot = sum(base.values())
-    keys = list(base.keys())
-    return str(rng.choice(keys, p=[base[k] / tot for k in keys]))
+    base = {level: max(0.01, weight) for level, weight in base.items()}
+    total = sum(base.values())
+    levels = list(base.keys())
+    return str(rng.choice(levels, p=[base[level] / total for level in levels]))
 
 
 def make_static(rng, category, operator_type, zone, zone_anchor):
-    cfg = CATEGORIES[category]
-    base_psf = float(rng.uniform(*cfg["sales_psf"]))
-    sqft = int(rng.uniform(*cfg["sqft"]))
-    baseline_rts = float(rng.uniform(*cfg["healthy_rts"]))
+    category_cfg = CATEGORIES[category]
+    base_psf = float(rng.uniform(*category_cfg["sales_psf"]))
+    sqft = int(rng.uniform(*category_cfg["sqft"]))
+    baseline_rts = float(rng.uniform(*category_cfg["healthy_rts"]))
     rent_psf = base_psf * baseline_rts  # baseline rent-to-sales lands in the healthy band
     return {
         "category": category,
@@ -286,26 +285,26 @@ def make_static(rng, category, operator_type, zone, zone_anchor):
         "base_psf": base_psf,
         "sqft": sqft,
         "rent_psf": rent_psf,
-        "season_amp": cfg["season_amp"],
+        "season_amp": category_cfg["season_amp"],
         "foot_base": float(rng.uniform(4000, 12000)),
     }
 
 
-def assemble_tenant(tenant_id, name, static, calendar, obs, exit_index,
+def assemble_tenant(tenant_id, name, tenant_static, calendar, observations, exit_index,
                     operator_type, risk_appetite, loyalty, lease_months_remaining,
                     is_anchor=False):
     """Build the tenant record (static + persona + lease + status)."""
     # Lease dates derived deterministically from term + months-remaining.
     lease_len_years = 10 if is_anchor else 3
-    lease_end_ym = add_months(SIM_END, lease_months_remaining)
-    lease_end = first_of_month(lease_end_ym)
-    lease_start = first_of_month(add_months(lease_end_ym, -12 * lease_len_years))
+    lease_end_year_month = add_months(SIM_END, lease_months_remaining)
+    lease_end = first_of_month(lease_end_year_month)
+    lease_start = first_of_month(add_months(lease_end_year_month, -12 * lease_len_years))
 
     if exit_index is not None:
         status = "exited"
         exit_date = first_of_month(calendar[exit_index]).isoformat()
         # truncate observations at exit
-        obs = obs[: exit_index + 1]
+        observations = observations[: exit_index + 1]
     else:
         status = "active"
         exit_date = None
@@ -313,13 +312,13 @@ def assemble_tenant(tenant_id, name, static, calendar, obs, exit_index,
     return {
         "tenant_id": tenant_id,
         "name": name,
-        "category": static["category"],
-        "sqft": static["sqft"],
-        "rent_per_sqft": round(static["rent_psf"], 2),
+        "category": tenant_static["category"],
+        "sqft": tenant_static["sqft"],
+        "rent_per_sqft": round(tenant_static["rent_psf"], 2),
         "lease_start": lease_start.isoformat(),
         "lease_end": lease_end.isoformat(),
         "mall_context": "northern_default",
-        "zone": static["zone"],
+        "zone": tenant_static["zone"],
         "is_anchor": is_anchor,
         "persona": {
             "operator_type": operator_type,
@@ -330,83 +329,87 @@ def assemble_tenant(tenant_id, name, static, calendar, obs, exit_index,
         },
         "status": status,
         "exit_date": exit_date,
-    }, obs
+    }, observations
 
 
 # ----------------------------------------------------------------------------
 # Demo cast — hard-coded so the demo is repeatable
 # ----------------------------------------------------------------------------
 
-def ramp(n, start, end, tail=12):
-    """Flat-ish then declining/rising path: steady for (n-tail), then linear to `end`."""
-    head = np.full(n - tail, start)
-    tailv = np.linspace(start, end, tail)
-    return np.concatenate([head, tailv])
+def ramp(n_months, start, end, tail_months=12):
+    """Flat-ish then declining/rising path: steady for (n_months - tail), then linear to `end`."""
+    head_vals = np.full(n_months - tail_months, start)
+    tail_vals = np.linspace(start, end, tail_months)
+    return np.concatenate([head_vals, tail_vals])
 
 
 def build_demo_tenants(rng, calendar):
     """The four narrative tenants with hand-set health paths + forced flags."""
-    n = len(calendar)
-    out = []
+    n_months = len(calendar)
+    demo_tenants = []
 
     # --- Atelier Margot — boutique apparel, HIGH risk, renegotiate ---
-    static = make_static(rng, "apparel_boutique", "owner_operator", "east", None)
-    static["base_psf"], static["sqft"] = 30.0, 1200
-    static["rent_psf"] = 30.0 * 0.135  # rts baseline ~13.5%, creeps to ~14%+
-    health = ramp(n, 1.00, 0.78, tail=12)
-    obs = build_observations(rng, calendar, health, static)
-    for k in range(-3, 0):
+    tenant_static = make_static(rng, "apparel_boutique", "owner_operator", "east", None)
+    tenant_static["base_psf"], tenant_static["sqft"] = 30.0, 1200
+    tenant_static["rent_psf"] = 30.0 * 0.135  # rts baseline ~13.5%, creeps to ~14%+
+    health_path = ramp(n_months, 1.00, 0.78, tail_months=12)
+    observations = build_observations(rng, calendar, health_path, tenant_static)
+    for month_offset in range(-3, 0):
         if rng.random() < 0.4:
-            obs[k]["late_payment_flag"] = True
-    obs[-2]["relief_or_exit_enquiry"] = True  # asked about a softer rent step
-    t, o = assemble_tenant("TENANT_DEMO_001", "Atelier Margot", static, calendar, obs,
-                           None, "owner_operator", "balanced", 0.80, lease_months_remaining=4)
-    t["persona"]["smooth_renewals"] = 1
-    out.append((t, o))
+            observations[month_offset]["late_payment_flag"] = True
+    observations[-2]["relief_or_exit_enquiry"] = True  # asked about a softer rent step
+    tenant_record, observation_list = assemble_tenant(
+        "TENANT_DEMO_001", "Atelier Margot", tenant_static, calendar, observations,
+        None, "owner_operator", "balanced", 0.80, lease_months_remaining=4)
+    tenant_record["persona"]["smooth_renewals"] = 1
+    demo_tenants.append((tenant_record, observation_list))
 
     # --- Pancho's Tacos — food court, VERY HIGH risk, replace ---
-    static = make_static(rng, "food_court", "franchise", "north", None)
-    static["base_psf"], static["sqft"] = 45.0, 450
-    static["rent_psf"] = 45.0 * 0.11
-    health = ramp(n, 0.95, 0.50, tail=18)
-    obs = build_observations(rng, calendar, health, static)
-    for k in range(-3, 0):
-        obs[k]["late_payment_flag"] = True
-    obs[-2]["relief_or_exit_enquiry"] = True  # enquired about early termination
-    for k in range(-4, 0):
-        obs[k]["stock_depth_index"] = round(float(np.clip(0.35 + rng.normal(0, 0.05), 0, 1)), 3)
-    t, o = assemble_tenant("TENANT_DEMO_002", "Pancho's Tacos", static, calendar, obs,
-                           None, "franchise", "balanced", 0.50, lease_months_remaining=7)
-    t["persona"]["contentious_renegotiations"] = 1
-    out.append((t, o))
+    tenant_static = make_static(rng, "food_court", "franchise", "north", None)
+    tenant_static["base_psf"], tenant_static["sqft"] = 45.0, 450
+    tenant_static["rent_psf"] = 45.0 * 0.11
+    health_path = ramp(n_months, 0.95, 0.50, tail_months=18)
+    observations = build_observations(rng, calendar, health_path, tenant_static)
+    for month_offset in range(-3, 0):
+        observations[month_offset]["late_payment_flag"] = True
+    observations[-2]["relief_or_exit_enquiry"] = True  # enquired about early termination
+    for month_offset in range(-4, 0):
+        observations[month_offset]["stock_depth_index"] = round(float(np.clip(0.35 + rng.normal(0, 0.05), 0, 1)), 3)
+    tenant_record, observation_list = assemble_tenant(
+        "TENANT_DEMO_002", "Pancho's Tacos", tenant_static, calendar, observations,
+        None, "franchise", "balanced", 0.50, lease_months_remaining=7)
+    tenant_record["persona"]["contentious_renegotiations"] = 1
+    demo_tenants.append((tenant_record, observation_list))
 
     # --- Crystal Mobile — phone repair, MODERATE, monitor ---
-    static = make_static(rng, "phone_repair", "franchise", "south", None)
-    static["base_psf"], static["sqft"] = 28.0, 250
-    static["rent_psf"] = 28.0 * 0.09
-    health = np.full(n, 0.88) + rng.normal(0, 0.015, n)
-    obs = build_observations(rng, calendar, health, static)
-    for ob in obs:
-        ob["late_payment_flag"] = False          # pays on time
-        ob["trading_hours_shortfall"] = round(float(abs(rng.normal(0, 0.02))), 3)
-    t, o = assemble_tenant("TENANT_DEMO_003", "Crystal Mobile", static, calendar, obs,
-                           None, "franchise", "cautious", 0.40, lease_months_remaining=15)
-    out.append((t, o))
+    tenant_static = make_static(rng, "phone_repair", "franchise", "south", None)
+    tenant_static["base_psf"], tenant_static["sqft"] = 28.0, 250
+    tenant_static["rent_psf"] = 28.0 * 0.09
+    health_path = np.full(n_months, 0.88) + rng.normal(0, 0.015, n_months)
+    observations = build_observations(rng, calendar, health_path, tenant_static)
+    for observation in observations:
+        observation["late_payment_flag"] = False          # pays on time
+        observation["trading_hours_shortfall"] = round(float(abs(rng.normal(0, 0.02))), 3)
+    tenant_record, observation_list = assemble_tenant(
+        "TENANT_DEMO_003", "Crystal Mobile", tenant_static, calendar, observations,
+        None, "franchise", "cautious", 0.40, lease_months_remaining=15)
+    demo_tenants.append((tenant_record, observation_list))
 
     # --- Pages & Co — bookstore, LOW, no action ---
-    static = make_static(rng, "bookstore", "owner_operator", "west", None)
-    static["base_psf"], static["sqft"] = 22.0, 1500
-    static["rent_psf"] = 22.0 * 0.09
-    health = np.full(n, 1.06) + rng.normal(0, 0.015, n)
-    obs = build_observations(rng, calendar, health, static)
-    for ob in obs:
-        ob["late_payment_flag"] = False
-    t, o = assemble_tenant("TENANT_DEMO_004", "Pages & Co", static, calendar, obs,
-                           None, "owner_operator", "cautious", 0.85, lease_months_remaining=20)
-    t["persona"]["smooth_renewals"] = 2
-    out.append((t, o))
+    tenant_static = make_static(rng, "bookstore", "owner_operator", "west", None)
+    tenant_static["base_psf"], tenant_static["sqft"] = 22.0, 1500
+    tenant_static["rent_psf"] = 22.0 * 0.09
+    health_path = np.full(n_months, 1.06) + rng.normal(0, 0.015, n_months)
+    observations = build_observations(rng, calendar, health_path, tenant_static)
+    for observation in observations:
+        observation["late_payment_flag"] = False
+    tenant_record, observation_list = assemble_tenant(
+        "TENANT_DEMO_004", "Pages & Co", tenant_static, calendar, observations,
+        None, "owner_operator", "cautious", 0.85, lease_months_remaining=20)
+    tenant_record["persona"]["smooth_renewals"] = 2
+    demo_tenants.append((tenant_record, observation_list))
 
-    return out
+    return demo_tenants
 
 
 # ----------------------------------------------------------------------------
@@ -416,120 +419,123 @@ def build_demo_tenants(rng, calendar):
 def build(seed=42, n_background=70, out_dir="data"):
     rng = np.random.default_rng(seed)
     calendar = months_back()
-    n = len(calendar)
+    n_months = len(calendar)
 
-    tenants, observations = [], []
+    tenants = []
+    observations_by_tenant = []  # list of (tenant_id, observation_list)
 
     # 1) Anchors — one per zone, distinct type; their health ripples to neighbours.
     zone_anchor_health = {}
     anchor_cats = list(ANCHOR_CATEGORIES.keys())
-    for i, zone in enumerate(ZONES):
-        cat = anchor_cats[i % len(anchor_cats)]
-        cfg = ANCHOR_CATEGORIES[cat]
+    for zone_idx, zone in enumerate(ZONES):
+        anchor_category = anchor_cats[zone_idx % len(anchor_cats)]
+        anchor_cfg = ANCHOR_CATEGORIES[anchor_category]
         # One anchor (north) is dying — drives the demo "anchor closed" ripple.
         if zone == "north":
-            health = ramp(n, 0.95, 0.45, tail=20)
+            health_path = ramp(n_months, 0.95, 0.45, tail_months=20)
         else:
-            health = gen_health_path(rng, n, start=1.05)
-        zone_anchor_health[zone] = health
-        static = {
-            "category": cat, "operator_type": "corporate", "zone": zone, "zone_anchor": None,
-            "base_psf": float(rng.uniform(*cfg["sales_psf"])), "sqft": int(rng.uniform(*cfg["sqft"])),
-            "season_amp": cfg["season_amp"], "foot_base": float(rng.uniform(20000, 40000)),
+            health_path = gen_health_path(rng, n_months, start=1.05)
+        zone_anchor_health[zone] = health_path
+        tenant_static = {
+            "category": anchor_category, "operator_type": "corporate", "zone": zone, "zone_anchor": None,
+            "base_psf": float(rng.uniform(*anchor_cfg["sales_psf"])), "sqft": int(rng.uniform(*anchor_cfg["sqft"])),
+            "season_amp": anchor_cfg["season_amp"], "foot_base": float(rng.uniform(20000, 40000)),
         }
-        static["rent_psf"] = static["base_psf"] * float(rng.uniform(*cfg["healthy_rts"]))
-        obs = build_observations(rng, calendar, health, static)
-        exit_index = sample_exit_index(rng, health)
-        inject_enquiries(rng, obs, health, exit_index)
-        t, o = assemble_tenant(f"ANCHOR_{zone.upper()}", f"{cat.replace('_', ' ').title()} ({zone})",
-                               static, calendar, obs, exit_index, "corporate", "cautious", 0.70,
-                               lease_months_remaining=int(rng.integers(6, 30)), is_anchor=True)
-        tenants.append(t)
-        observations.append((t["tenant_id"], o))
+        tenant_static["rent_psf"] = tenant_static["base_psf"] * float(rng.uniform(*anchor_cfg["healthy_rts"]))
+        observations = build_observations(rng, calendar, health_path, tenant_static)
+        exit_index = sample_exit_index(rng, health_path)
+        inject_enquiries(rng, observations, health_path, exit_index)
+        tenant_record, observation_list = assemble_tenant(
+            f"ANCHOR_{zone.upper()}", f"{anchor_category.replace('_', ' ').title()} ({zone})",
+            tenant_static, calendar, observations, exit_index, "corporate", "cautious", 0.70,
+            lease_months_remaining=int(rng.integers(6, 30)), is_anchor=True)
+        tenants.append(tenant_record)
+        observations_by_tenant.append((tenant_record["tenant_id"], observation_list))
 
     # 2) Demo cast (hard-coded)
-    for t, o in build_demo_tenants(rng, calendar):
-        tenants.append(t)
-        observations.append((t["tenant_id"], o))
+    for tenant_record, observation_list in build_demo_tenants(rng, calendar):
+        tenants.append(tenant_record)
+        observations_by_tenant.append((tenant_record["tenant_id"], observation_list))
 
     # 3) Background tenants
-    cat_names = list(CATEGORIES.keys())
+    category_names = list(CATEGORIES.keys())
     for i in range(n_background):
-        category = str(rng.choice(cat_names))
+        category = str(rng.choice(category_names))
         zone = str(rng.choice(ZONES))
         operator_type = sample_operator_type(rng, category)
-        risk = sample_risk_appetite(rng, category, operator_type)
+        risk_appetite = sample_risk_appetite(rng, category, operator_type)
         loyalty = float(np.clip(rng.normal(0.55, 0.18), 0.05, 0.95))
-        static = make_static(rng, category, operator_type, zone, zone_anchor_health[zone])
-        health = gen_health_path(rng, n, start=float(rng.uniform(0.92, 1.08)),
-                                 zone_anchor=zone_anchor_health[zone])
-        obs = build_observations(rng, calendar, health, static)
-        exit_index = sample_exit_index(rng, health)
-        inject_enquiries(rng, obs, health, exit_index)
-        t, o = assemble_tenant(f"TENANT_{i + 1:03d}", f"Tenant {i + 1}", static, calendar, obs,
-                               exit_index, operator_type, risk, loyalty,
-                               lease_months_remaining=int(rng.integers(1, 30)))
-        tenants.append(t)
-        observations.append((t["tenant_id"], o))
+        tenant_static = make_static(rng, category, operator_type, zone, zone_anchor_health[zone])
+        health_path = gen_health_path(rng, n_months, start=float(rng.uniform(0.92, 1.08)),
+                                      zone_anchor=zone_anchor_health[zone])
+        observations = build_observations(rng, calendar, health_path, tenant_static)
+        exit_index = sample_exit_index(rng, health_path)
+        inject_enquiries(rng, observations, health_path, exit_index)
+        tenant_record, observation_list = assemble_tenant(
+            f"TENANT_{i + 1:03d}", f"Tenant {i + 1}", tenant_static, calendar, observations,
+            exit_index, operator_type, risk_appetite, loyalty,
+            lease_months_remaining=int(rng.integers(1, 30)))
+        tenants.append(tenant_record)
+        observations_by_tenant.append((tenant_record["tenant_id"], observation_list))
 
     # Flatten observations to one record per tenant-month
-    obs_records = []
-    for tid, olist in observations:
-        for ob in olist:
-            obs_records.append({"tenant_id": tid, **ob})
+    observation_records = []
+    for tenant_id, observation_list in observations_by_tenant:
+        for observation in observation_list:
+            observation_records.append({"tenant_id": tenant_id, **observation})
 
     # Write
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "tenants.json").write_text(json.dumps(tenants, indent=2))
-    (out / "observations.json").write_text(json.dumps(obs_records, indent=2))
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    (out_path / "tenants.json").write_text(json.dumps(tenants, indent=2))
+    (out_path / "observations.json").write_text(json.dumps(observation_records, indent=2))
 
-    summarise(tenants, obs_records)
-    return tenants, obs_records
+    summarise(tenants, observation_records)
+    return tenants, observation_records
 
 
 # ----------------------------------------------------------------------------
 # Sanity-check summary
 # ----------------------------------------------------------------------------
 
-def summarise(tenants, obs_records):
-    n_t = len(tenants)
-    n_anchor = sum(t["is_anchor"] for t in tenants)
-    n_exit = sum(t["status"] == "exited" for t in tenants)
-    print(f"\n{'='*64}\nGENERATED: {n_t} tenants ({n_anchor} anchors), "
-          f"{len(obs_records)} observations")
-    print(f"Exits: {n_exit}/{n_t}  ({100*n_exit/n_t:.0f}%)  - events for Cox PH")
+def summarise(tenants, observation_records):
+    n_tenants = len(tenants)
+    n_anchors = sum(tenant["is_anchor"] for tenant in tenants)
+    n_exits = sum(tenant["status"] == "exited" for tenant in tenants)
+    print(f"\n{'='*64}\nGENERATED: {n_tenants} tenants ({n_anchors} anchors), "
+          f"{len(observation_records)} observations")
+    print(f"Exits: {n_exits}/{n_tenants}  ({100*n_exits/n_tenants:.0f}%)  - events for Cox PH")
 
     # Branch sanity: mean feature for exited vs active tenants (last-12mo mean).
-    exited_ids = {t["tenant_id"] for t in tenants if t["status"] == "exited"}
-    by_t = {}
-    for r in obs_records:
-        by_t.setdefault(r["tenant_id"], []).append(r)
+    exited_ids = {tenant["tenant_id"] for tenant in tenants if tenant["status"] == "exited"}
+    obs_by_tenant = {}
+    for record in observation_records:
+        obs_by_tenant.setdefault(record["tenant_id"], []).append(record)
 
     def grp_mean(field, exited):
-        vals = []
-        for tid, rows in by_t.items():
-            if (tid in exited_ids) != exited:
+        values = []
+        for tenant_id, rows in obs_by_tenant.items():
+            if (tenant_id in exited_ids) != exited:
                 continue
-            tail = rows[-12:]
-            vals.extend(float(x[field]) for x in tail)
-        return np.mean(vals) if vals else float("nan")
+            recent = rows[-12:]
+            values.extend(float(row[field]) for row in recent)
+        return np.mean(values) if values else float("nan")
 
     print(f"\n{'feature':<26}{'exited (mean)':>15}{'active (mean)':>15}  (expect separation)")
-    for f in ["rent_to_sales_ratio", "late_payment_flag", "trading_hours_shortfall",
-              "relief_or_exit_enquiry", "stock_depth_index", "credit_trend_3mo"]:
-        print(f"{f:<26}{grp_mean(f, True):>15.4f}{grp_mean(f, False):>15.4f}")
+    for feature in ["rent_to_sales_ratio", "late_payment_flag", "trading_hours_shortfall",
+                    "relief_or_exit_enquiry", "stock_depth_index", "credit_trend_3mo"]:
+        print(f"{feature:<26}{grp_mean(feature, True):>15.4f}{grp_mean(feature, False):>15.4f}")
 
     print(f"\nDemo cast (final observed month):")
-    for t in tenants:
-        if t["tenant_id"].startswith("TENANT_DEMO"):
-            rows = by_t[t["tenant_id"]]
+    for tenant in tenants:
+        if tenant["tenant_id"].startswith("TENANT_DEMO"):
+            rows = obs_by_tenant[tenant["tenant_id"]]
             last = rows[-1]
-            print(f"  {t['name']:<16} rts={last['rent_to_sales_ratio']:.3f}  "
+            print(f"  {tenant['name']:<16} rts={last['rent_to_sales_ratio']:.3f}  "
                   f"late={int(last['late_payment_flag'])}  "
                   f"stock={last['stock_depth_index']:.2f}  "
                   f"credit={last['credit_trend_3mo']:+.3f}  "
-                  f"status={t['status']}")
+                  f"status={tenant['status']}")
     print('='*64)
 
 
