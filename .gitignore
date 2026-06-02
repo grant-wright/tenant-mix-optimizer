@@ -1,3 +1,6 @@
+# Generated data (reproducible from generate_synthetic_data.py with a fixed seed)
+data/
+
 # Python
 __pycache__/
 *.py[cod]

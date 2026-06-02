@@ -37,7 +37,7 @@ Google Agent Builder ── Gemini API
 | LLM | Gemini 2.0 Flash / Pro |
 | Database | MongoDB Atlas M0 (free tier) |
 | Survival model | Python `lifelines` — Cox Proportional Hazards |
-| Backend tools | Python 3.12, Google Cloud Functions |
+| Backend tools | Python 3.11, Google Cloud Functions |
 | Secrets | Google Secret Manager |
 | Infrastructure | Google Cloud (project: `rapid-agent-tenant-mix`) |
 
@@ -47,7 +47,7 @@ Google Agent Builder ── Gemini API
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.11 (matches the Cloud Functions deploy runtime)
 - Google Cloud SDK (`gcloud`)
 - MongoDB Atlas account with M0 cluster
 - `gh` CLI (optional, for repo management)
