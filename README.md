@@ -52,13 +52,26 @@ Google Agent Builder ── Gemini API
 - MongoDB Atlas account with M0 cluster
 - `gh` CLI (optional, for repo management)
 
-### 1. Clone and install
+### 1. Clone, create a virtual environment, and install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/tenant-mix-optimizer.git
+git clone https://github.com/grant-wright/tenant-mix-optimizer.git
 cd tenant-mix-optimizer
+
+# Create an isolated environment so this project's deps stay off the system Python
+python -m venv .venv
+
+# Activate it:
+#   Windows (PowerShell):  .venv\Scripts\Activate.ps1
+#   Windows (cmd):         .venv\Scripts\activate.bat
+#   macOS / Linux:         source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
+
+> The `.venv/` folder is gitignored — each machine creates its own. If you skip
+> activation, prefix commands with the venv's interpreter, e.g.
+> `.venv\Scripts\python.exe scripts/generate_synthetic_data.py`.
 
 ### 2. Configure environment
 
