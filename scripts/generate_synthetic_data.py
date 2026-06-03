@@ -97,6 +97,16 @@ ZONES = ["north", "south", "east", "west"]
 
 RISK_BASE = {"cautious": 0.30, "balanced": 0.50, "bold": 0.20}
 
+# Mall tiers — only used with --tier-mix (the training population). Scale
+# productivity + traffic; rent scales with sales so the rent-to-sales band is
+# preserved across tiers. A per-tenant proxy for "pooled across malls of
+# different tiers". The demo mall (data/) stays single-tier.
+TIERS = {
+    "prime":    dict(sales_mult=1.40, foot_mult=1.50, weight=0.25),
+    "suburban": dict(sales_mult=1.00, foot_mult=1.00, weight=0.50),
+    "outlet":   dict(sales_mult=0.75, foot_mult=0.80, weight=0.25),
+}
+
 
 # ----------------------------------------------------------------------------
 # Small maths helpers
@@ -271,22 +281,28 @@ def sample_risk_appetite(rng, category, operator_type):
     return str(rng.choice(levels, p=[base[level] / total for level in levels]))
 
 
-def make_static(rng, category, operator_type, zone, zone_anchor):
+def make_static(rng, category, operator_type, zone, zone_anchor, tier_mix=False):
     category_cfg = CATEGORIES[category]
-    base_psf = float(rng.uniform(*category_cfg["sales_psf"]))
+    if tier_mix:
+        tier = str(rng.choice(list(TIERS), p=[TIERS[t]["weight"] for t in TIERS]))
+        sales_mult, foot_mult = TIERS[tier]["sales_mult"], TIERS[tier]["foot_mult"]
+    else:
+        tier, sales_mult, foot_mult = "northern_default", 1.0, 1.0
+    base_psf = float(rng.uniform(*category_cfg["sales_psf"])) * sales_mult
     sqft = int(rng.uniform(*category_cfg["sqft"]))
     baseline_rts = float(rng.uniform(*category_cfg["healthy_rts"]))
-    rent_psf = base_psf * baseline_rts  # baseline rent-to-sales lands in the healthy band
+    rent_psf = base_psf * baseline_rts  # rent scales with sales -> rts band preserved across tiers
     return {
         "category": category,
         "operator_type": operator_type,
         "zone": zone,
         "zone_anchor": zone_anchor,
+        "mall_context": tier,
         "base_psf": base_psf,
         "sqft": sqft,
         "rent_psf": rent_psf,
         "season_amp": category_cfg["season_amp"],
-        "foot_base": float(rng.uniform(4000, 12000)),
+        "foot_base": float(rng.uniform(4000, 12000)) * foot_mult,
     }
 
 
@@ -317,7 +333,7 @@ def assemble_tenant(tenant_id, name, tenant_static, calendar, observations, exit
         "rent_per_sqft": round(tenant_static["rent_psf"], 2),
         "lease_start": lease_start.isoformat(),
         "lease_end": lease_end.isoformat(),
-        "mall_context": "northern_default",
+        "mall_context": tenant_static.get("mall_context", "northern_default"),
         "zone": tenant_static["zone"],
         "is_anchor": is_anchor,
         "persona": {
@@ -416,7 +432,7 @@ def build_demo_tenants(rng, calendar):
 # Main build
 # ----------------------------------------------------------------------------
 
-def build(seed=42, n_background=70, out_dir="data"):
+def build(seed=42, n_background=70, out_dir="data", tier_mix=False):
     rng = np.random.default_rng(seed)
     calendar = months_back()
     n_months = len(calendar)
@@ -465,7 +481,8 @@ def build(seed=42, n_background=70, out_dir="data"):
         operator_type = sample_operator_type(rng, category)
         risk_appetite = sample_risk_appetite(rng, category, operator_type)
         loyalty = float(np.clip(rng.normal(0.55, 0.18), 0.05, 0.95))
-        tenant_static = make_static(rng, category, operator_type, zone, zone_anchor_health[zone])
+        tenant_static = make_static(rng, category, operator_type, zone,
+                                    zone_anchor_health[zone], tier_mix=tier_mix)
         health_path = gen_health_path(rng, n_months, start=float(rng.uniform(0.92, 1.08)),
                                       zone_anchor=zone_anchor_health[zone])
         observations = build_observations(rng, calendar, health_path, tenant_static)
@@ -544,5 +561,7 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--background", type=int, default=70)
     ap.add_argument("--out", type=str, default="data")
+    ap.add_argument("--tier-mix", action="store_true",
+                    help="vary mall tier across tenants (use for the training population)")
     args = ap.parse_args()
-    build(seed=args.seed, n_background=args.background, out_dir=args.out)
+    build(seed=args.seed, n_background=args.background, out_dir=args.out, tier_mix=args.tier_mix)

@@ -1,5 +1,6 @@
 # Generated data (reproducible from generate_synthetic_data.py with a fixed seed)
 data/
+data_train/
 
 # Python
 __pycache__/
