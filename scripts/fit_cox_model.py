@@ -385,8 +385,15 @@ def main(seed=42, data_dir="data", holdout_frac=0.2, penalizer=0.1):
                  gate_landmark=gate_landmark, km_separates=km_separates,
                  overall=overall, movers=movers)
 
+    # Save a model bundle rather than the bare model: the Cloud Function needs
+    # the training population's log partial hazard distribution to compute a
+    # percentile-rank score alongside the sigmoid score (belt-and-braces).
+    # We use each tenant's LAST training observation (current state at exit/censor).
+    last_train = train_df.loc[train_df.groupby("tenant_id")["stop"].idxmax()]
+    train_log_ph = model.predict_log_partial_hazard(last_train[FEATURE_NAMES]).values
+    bundle = {"model": model, "train_log_ph": train_log_ph}
     with open(data / "cox_model.pkl", "wb") as fh:
-        pickle.dump(model, fh)
+        pickle.dump(bundle, fh)
 
     # Console gate summary
     print("\n" + "=" * 72)

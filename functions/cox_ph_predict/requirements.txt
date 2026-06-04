@@ -1,0 +1,6 @@
+functions-framework==3.*
+pymongo[srv]>=4.7
+numpy>=2.0
+pandas>=2.0
+lifelines>=0.29
+python-dotenv>=1.0

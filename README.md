@@ -90,7 +90,7 @@ pwsh scripts/gcp_setup.ps1
 ### 4. Seed MongoDB
 
 ```bash
-python scripts/mongo_seed.py
+python scripts/mongo_setup.py
 ```
 
 ---

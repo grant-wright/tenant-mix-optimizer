@@ -70,6 +70,9 @@ $RECYCLE.BIN/
 service-account-key*.json
 *-key.json
 
+# Model artefacts — copy to functions/cox_ph_predict/model/ before deploy, never commit
+functions/cox_ph_predict/model/*.pkl
+
 # Secrets
 secrets/
 *.pem
