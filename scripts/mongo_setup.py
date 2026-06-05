@@ -2,6 +2,13 @@
 MongoDB Atlas setup script — creates tenant_mix database and collections.
 Run AFTER creating your Atlas M0 cluster and setting MONGODB_URI in .env
 
+Idempotent: a collection that already exists has its validator brought up to
+date via collMod (rather than being skipped). This matters because the schema
+evolves — e.g. the Day-6 alert layer widened the observations validator with
+credit_band / enquiry_type enums. create_collection raises CollectionInvalid
+on an existing collection, so the old "create-or-skip" approach silently left
+live validators stale. Re-run this script after any COLLECTIONS change to sync.
+
 Usage:
     python scripts/mongo_setup.py
 """
@@ -9,7 +16,6 @@ Usage:
 import os
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from pymongo.errors import CollectionInvalid
 
 load_dotenv()
 
@@ -141,12 +147,19 @@ def main():
     client = MongoClient(URI)
     db = client[DB_NAME]
 
+    existing = set(db.list_collection_names())
+
     for name, validator in COLLECTIONS.items():
-        try:
-            db.create_collection(name, validator={"$jsonSchema": validator["$jsonSchema"]})
+        schema = {"$jsonSchema": validator["$jsonSchema"]}
+        if name in existing:
+            # collMod re-applies the validator to an existing collection. It
+            # governs future inserts/updates only — existing docs are not
+            # re-validated, so a widened validator is always safe to push.
+            db.command("collMod", name, validator=schema)
+            print(f"  updated  {name} (validator synced)")
+        else:
+            db.create_collection(name, validator=schema)
             print(f"  created  {name}")
-        except CollectionInvalid:
-            print(f"  exists   {name} (skipped)")
 
     print(f"\nCollections in '{DB_NAME}':")
     for c in db.list_collection_names():
