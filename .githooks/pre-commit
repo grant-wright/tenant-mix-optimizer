@@ -1,0 +1,21 @@
+#!/bin/sh
+# pre-commit — scope visibility (a reminder, never a gate).
+#
+# Prints exactly what is about to be committed (file list + line counts) so an
+# unintended scope is impossible to miss — e.g. a one-line change that silently
+# carries a pile of older uncommitted edits. If the scope looks wrong: Ctrl-C,
+# fix the staging, commit again. Always exits 0 — it never blocks a commit.
+#
+# Enable per clone (config is not pushed):  git config core.hooksPath .githooks
+
+staged=$(git diff --cached --name-only)
+[ -z "$staged" ] && exit 0
+
+echo "------------------------------------------------------------"
+echo " pre-commit scope check — staged for this commit:"
+echo "------------------------------------------------------------"
+git diff --cached --stat
+echo "------------------------------------------------------------"
+echo " ^ check the line counts. Unexpected scope? Ctrl-C and re-stage."
+echo "------------------------------------------------------------"
+exit 0
