@@ -11,9 +11,17 @@ Branches (see docs/manuals + the planning repo's synthetic-data-strategy.md v5):
   1. Revenue      — sales, sales_per_sqft, rent_to_sales_ratio, foot_traffic
   2. Operational  — late_payment_flag (strong), trading_hours_shortfall (moderate)
   3. Leading      — relief_or_exit_enquiry (weak + randomised lead time, anti-leak),
-                    stock_depth_index (moderate)
-  4. External     — credit_trend_3mo (third-party; informative for corporate/
-                    franchise, thin for owner-operators)
+                    typed enquiry_type (latent-derived intent), stock_depth_index (moderate)
+  4. External     — a latent credit-score random walk (mean-reverting to a
+                    health-implied target) -> credit_band, signed credit_notches_changed
+                    (band movement: + improved, - downgraded), and the continuous
+                    credit_trend_3mo. Generated for ALL tenants; owner-operators get a
+                    thicker walk (thinner real files) but a real band — decisions.md §6.
+
+Branches 3 (enquiry_type) and 4 (credit band/downgrade) are the ALERT layer — discrete
+high-impact events surfaced as flags, NOT Cox covariates. Both derive from the same
+latent `financial_health` as the ambient branches: a different *read* on health, not
+noise. The 5 Cox covariates are unchanged, so no model refit is forced.
 
 The outcome (exit) descends from the latent directly, NOT from the features.
 
@@ -52,13 +60,25 @@ EXIT_K = 4.5
 LATE_INTERCEPT, LATE_SLOPE = -1.0, 4.0          # operational, STRONG
 TRADING_GAIN, TRADING_NOISE = 0.6, 0.08         # operational, moderate
 STOCK_GAIN, STOCK_NOISE = 0.5, 0.10             # leading, moderate
-CREDIT_NOISE_CORP = 0.015                       # external, moderate (corp/franchise)
-CREDIT_NOISE_THIN = 0.012                       # external, near-zero signal (owner-op)
+
+# External credit (alert layer). A latent credit score (FICO-like 300-850) mean-
+# reverts each month toward a health-implied target, with monthly walk noise. The
+# band derives from the score; a downgrade event = a band step-down. Generated for
+# ALL tenants; owner-operators get a thicker walk (a nod to thinner real files) but
+# a real band. See decisions.md 2026-06-05 §6.
+CREDIT_REVERSION = 0.30                          # speed the score tracks its health target
+CREDIT_WALK_CORP = 8.0                           # monthly walk noise (points), corp/franchise
+CREDIT_WALK_OWNER = 18.0                         # thicker noise for owner-operators
+CREDIT_BANDS = [                                 # (min score inclusive, label), best -> worst
+    (750, "strong"), (680, "fair"), (620, "adequate"), (560, "weak"), (0, "distressed"),
+]
+BAND_ORDER = ["strong", "fair", "adequate", "weak", "distressed"]  # index = severity (worse = higher)
 
 # Anti-leakage for relief_or_exit_enquiry
 ENQUIRY_LEAD_MIN, ENQUIRY_LEAD_MAX = 2, 9       # months before exit
 ENQUIRY_FALSE_NEG = 0.30                         # exiters with no prior enquiry
 ENQUIRY_FALSE_POS_RATE = 0.02                    # monthly, for chronically-stressed survivors
+ENQUIRY_TYPES = ["rent_relief", "downsize", "sublet", "early_termination"]
 
 # Seasonality: calendar-month multiplier (retail peaks Nov/Dec).
 SEASON_BY_MONTH = {
@@ -178,9 +198,49 @@ def sample_exit_index(rng, health_path):
     return None
 
 
-def credit_score(health: float) -> float:
-    """Map latent health to a notional credit score (~300-850)."""
-    return 650.0 + 180.0 * (health - 1.0)
+def target_credit_score(health: float) -> float:
+    """Health-implied 'fair value' the latent credit score reverts toward (300-850)."""
+    return float(np.clip(300.0 + 500.0 * health, 300.0, 850.0))
+
+
+def gen_credit_path(rng, health_path, operator_type):
+    """Latent credit score: a mean-reverting random walk toward the health target.
+
+    Credit has its own momentum and lags health (a *different read* on it, not a
+    restatement). Owner-operators get a thicker walk — a nod to thinner real files —
+    but still a real band.
+    """
+    walk_noise = CREDIT_WALK_OWNER if operator_type == "owner_operator" else CREDIT_WALK_CORP
+    n_months = len(health_path)
+    score = np.empty(n_months)
+    score[0] = target_credit_score(health_path[0]) + rng.normal(0, walk_noise)
+    for month_idx in range(1, n_months):
+        target = target_credit_score(health_path[month_idx])
+        score[month_idx] = (score[month_idx - 1]
+                            + CREDIT_REVERSION * (target - score[month_idx - 1])
+                            + rng.normal(0, walk_noise))
+    return np.clip(score, 300.0, 850.0)
+
+
+def band_of_score(score: float) -> str:
+    """Map a credit score to its band label."""
+    for threshold, label in CREDIT_BANDS:
+        if score >= threshold:
+            return label
+    return "distressed"
+
+
+def sample_enquiry_type(rng, health: float) -> str:
+    """Latent-derived enquiry intent: early_termination for the very unhealthy,
+    rent_relief for the moderately struggling (decisions.md 2026-06-05 §6)."""
+    stress = stress_of(health)
+    weights = np.array([
+        1.0 + 1.5 * (1.0 - stress),   # rent_relief — favoured when less desperate
+        0.7,                          # downsize
+        0.6,                          # sublet
+        0.2 + 2.0 * stress * stress,  # early_termination — favoured when very unhealthy
+    ])
+    return str(rng.choice(ENQUIRY_TYPES, p=weights / weights.sum()))
 
 
 def build_observations(rng, calendar, health_path, tenant_static):
@@ -191,6 +251,10 @@ def build_observations(rng, calendar, health_path, tenant_static):
     season_amp = tenant_static["season_amp"]
     operator_type = tenant_static["operator_type"]
     zone_anchor = tenant_static.get("zone_anchor")
+
+    # External branch: latent credit-score walk -> band + discrete downgrade events.
+    credit_path = gen_credit_path(rng, health_path, operator_type)
+    prev_band = None
 
     observations = []
     for month_idx, year_month in enumerate(calendar):
@@ -212,15 +276,19 @@ def build_observations(rng, calendar, health_path, tenant_static):
         # Branch 3 — leading (relief_or_exit_enquiry injected later, anti-leak)
         stock_depth_index = float(np.clip(1.0 - STOCK_GAIN * stress + rng.normal(0, STOCK_NOISE), 0.0, 1.0))
 
-        # Branch 4 — external / third-party
-        if operator_type in ("corporate", "franchise"):
-            if month_idx >= 3:
-                raw_trend = (credit_score(health_path[month_idx]) - credit_score(health_path[month_idx - 3])) / 100.0
-            else:
-                raw_trend = 0.0
-            credit_trend = float(np.clip(raw_trend + rng.normal(0, CREDIT_NOISE_CORP), -0.40, 0.40))
+        # Branch 4 — external / third-party (alert layer; not a Cox covariate)
+        band = band_of_score(credit_path[month_idx])
+        # Signed band movement vs last month: + = improved (severity fell),
+        # - = downgraded. Sign anchored to the score, like credit_trend_3mo.
+        if prev_band is None:
+            notches_changed = 0
         else:
-            credit_trend = float(rng.normal(0, CREDIT_NOISE_THIN))  # thin file: ~no signal
+            notches_changed = BAND_ORDER.index(prev_band) - BAND_ORDER.index(band)
+        prev_band = band
+        if month_idx >= 3:
+            credit_trend = float(np.clip((credit_path[month_idx] - credit_path[month_idx - 3]) / 100.0, -0.40, 0.40))
+        else:
+            credit_trend = 0.0
 
         observations.append({
             "month": month_str(year_month),
@@ -231,8 +299,11 @@ def build_observations(rng, calendar, health_path, tenant_static):
             "late_payment_flag": bool(late_payment),
             "trading_hours_shortfall": round(trading_hours_shortfall, 3),
             "relief_or_exit_enquiry": False,  # set by inject_enquiries()
+            "enquiry_type": None,             # set by inject_enquiries() when an enquiry fires
             "stock_depth_index": round(stock_depth_index, 3),
             "credit_trend_3mo": round(credit_trend, 4),
+            "credit_band": band,
+            "credit_notches_changed": int(notches_changed),
         })
     return observations
 
@@ -249,12 +320,14 @@ def inject_enquiries(rng, observations, health_path, exit_index):
             enquiry_idx = exit_index - lead_months
             if 0 <= enquiry_idx < n_periods:
                 observations[enquiry_idx]["relief_or_exit_enquiry"] = True
+                observations[enquiry_idx]["enquiry_type"] = sample_enquiry_type(rng, health_path[enquiry_idx])
     else:
         # False positives: chronically-stressed survivors sometimes enquire.
         for month_idx in range(6, n_periods):
             chronic_stress = np.mean([stress_of(health_path[m]) for m in range(month_idx - 6, month_idx)])
             if chronic_stress > 0.45 and rng.random() < ENQUIRY_FALSE_POS_RATE * (1 + chronic_stress):
                 observations[month_idx]["relief_or_exit_enquiry"] = True
+                observations[month_idx]["enquiry_type"] = sample_enquiry_type(rng, health_path[month_idx])
 
 
 # ----------------------------------------------------------------------------
@@ -374,6 +447,7 @@ def build_demo_tenants(rng, calendar):
         if rng.random() < 0.4:
             observations[month_offset]["late_payment_flag"] = True
     observations[-2]["relief_or_exit_enquiry"] = True  # asked about a softer rent step
+    observations[-2]["enquiry_type"] = "rent_relief"
     tenant_record, observation_list = assemble_tenant(
         "TENANT_DEMO_001", "Atelier Margot", tenant_static, calendar, observations,
         None, "owner_operator", "balanced", 0.80, lease_months_remaining=4)
@@ -389,6 +463,7 @@ def build_demo_tenants(rng, calendar):
     for month_offset in range(-3, 0):
         observations[month_offset]["late_payment_flag"] = True
     observations[-2]["relief_or_exit_enquiry"] = True  # enquired about early termination
+    observations[-2]["enquiry_type"] = "early_termination"
     for month_offset in range(-4, 0):
         observations[month_offset]["stock_depth_index"] = round(float(np.clip(0.35 + rng.normal(0, 0.05), 0, 1)), 3)
     tenant_record, observation_list = assemble_tenant(
@@ -543,15 +618,30 @@ def summarise(tenants, observation_records):
                     "relief_or_exit_enquiry", "stock_depth_index", "credit_trend_3mo"]:
         print(f"{feature:<26}{grp_mean(feature, True):>15.4f}{grp_mean(feature, False):>15.4f}")
 
+    # Alert-layer sanity: credit-band spread + how many tenant-months carry a typed enquiry.
+    band_counts = {label: 0 for _, label in CREDIT_BANDS}
+    for record in observation_records:
+        band_counts[record["credit_band"]] += 1
+    enquiry_types = {t: 0 for t in ENQUIRY_TYPES}
+    for record in observation_records:
+        if record["enquiry_type"]:
+            enquiry_types[record["enquiry_type"]] += 1
+    print(f"\nCredit band (tenant-months): "
+          + "  ".join(f"{label}={band_counts[label]}" for _, label in CREDIT_BANDS))
+    print(f"Enquiry types (tenant-months): "
+          + "  ".join(f"{t}={enquiry_types[t]}" for t in ENQUIRY_TYPES))
+
     print(f"\nDemo cast (final observed month):")
     for tenant in tenants:
         if tenant["tenant_id"].startswith("TENANT_DEMO"):
             rows = obs_by_tenant[tenant["tenant_id"]]
             last = rows[-1]
+            enquiry = next((r["enquiry_type"] for r in reversed(rows[-6:]) if r["enquiry_type"]), "-")
             print(f"  {tenant['name']:<16} rts={last['rent_to_sales_ratio']:.3f}  "
                   f"late={int(last['late_payment_flag'])}  "
                   f"stock={last['stock_depth_index']:.2f}  "
-                  f"credit={last['credit_trend_3mo']:+.3f}  "
+                  f"band={last['credit_band']:<10} "
+                  f"enquiry={enquiry:<16} "
                   f"status={tenant['status']}")
     print('='*64)
 
