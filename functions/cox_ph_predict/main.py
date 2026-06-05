@@ -110,15 +110,24 @@ def _featurise(obs: list) -> dict:
         odf["stock_depth_index"].rolling(3, min_periods=1).mean()
     )
 
-    # Alert-layer signals (not model inputs; returned as flags for the agent)
-    odf["enquiry_recent_6mo"] = (
-        odf["relief_or_exit_enquiry"].astype(int).rolling(6, min_periods=1).max()
-    )
-    odf["credit_trend_3mo_mean"] = (
-        odf["credit_trend_3mo"].rolling(3, min_periods=1).mean()
-    )
+    # Model-covariate row (last observed month).
+    row = odf.iloc[-1].to_dict()
 
-    return odf.iloc[-1].to_dict()
+    # Alert-layer signals (not model inputs; returned as typed/banded flags for the
+    # agent's second layer — see decisions.md 2026-06-05 §5). Computed over the
+    # trailing 6 months for events, latest month for the standing credit band.
+    recent6 = odf.tail(6)
+    enquired = recent6["relief_or_exit_enquiry"].astype(bool)
+    enq_types = recent6.loc[enquired, "enquiry_type"].dropna()
+    row["alert_enquiry_recent_6mo"] = bool(enquired.any())
+    row["alert_enquiry_type"] = str(enq_types.iloc[-1]) if len(enq_types) else None
+
+    row["alert_credit_band"] = row.get("credit_band")
+    # Net signed band movement over the window: + improved, - net downgrade.
+    row["alert_credit_notches_changed_6mo"] = int(recent6["credit_notches_changed"].sum())
+    row["alert_credit_trend_3mo_mean"] = float(odf["credit_trend_3mo"].tail(3).mean())
+
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +203,15 @@ def cox_ph_predict(request):
             "hazard_percentile": round(percentile, 3),
             "hazard_sigmoid": round(sigmoid, 3),
             "alert_flags": {
-                "enquiry_recent_6mo": bool(features.get("enquiry_recent_6mo", 0)),
-                "credit_trend_3mo_mean": round(float(features.get("credit_trend_3mo_mean", 0.0)), 4),
+                "enquiry": {
+                    "type": features.get("alert_enquiry_type"),
+                    "recent_6mo": bool(features.get("alert_enquiry_recent_6mo", False)),
+                },
+                "credit": {
+                    "band": features.get("alert_credit_band"),
+                    "notches_changed_6mo": int(features.get("alert_credit_notches_changed_6mo", 0)),
+                    "trend_3mo_mean": round(float(features.get("alert_credit_trend_3mo_mean", 0.0)), 4),
+                },
             },
             "top_features": top,
             "computed_at": datetime.now(timezone.utc).isoformat(),

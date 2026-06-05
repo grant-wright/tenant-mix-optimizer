@@ -34,9 +34,9 @@ REQUIRED_OBSERVATION_FIELDS = {
     # Branch 2 — operational
     "late_payment_flag", "trading_hours_shortfall",
     # Branch 3 — leading
-    "relief_or_exit_enquiry", "stock_depth_index",
-    # Branch 4 — external (alert-layer signal, not a model covariate)
-    "credit_trend_3mo",
+    "relief_or_exit_enquiry", "enquiry_type", "stock_depth_index",
+    # Branch 4 — external (alert-layer signals, not model covariates)
+    "credit_trend_3mo", "credit_band", "credit_notches_changed",
 }
 
 

@@ -68,9 +68,17 @@ COLLECTIONS = {
                 "trading_hours_shortfall":{"bsonType": ["double", "int", "null"]},
                 # Branch 3 — leading/relationship
                 "relief_or_exit_enquiry": {"bsonType": ["bool", "null"]},
+                "enquiry_type":           {"bsonType": ["string", "null"],
+                                           "enum": ["rent_relief", "downsize", "sublet",
+                                                    "early_termination", None]},
                 "stock_depth_index":      {"bsonType": ["double", "int", "null"]},
-                # Branch 4 — external (alert layer; not a Cox covariate)
+                # Branch 4 — external (alert layer; not Cox covariates)
                 "credit_trend_3mo":       {"bsonType": ["double", "int", "null"]},
+                "credit_band":            {"bsonType": ["string", "null"],
+                                           "enum": ["strong", "fair", "adequate", "weak",
+                                                    "distressed", None]},
+                "credit_notches_changed": {"bsonType": ["int", "null"],
+                                           "description": "signed band movement: + improved, - downgraded"},
             },
         }
     },
