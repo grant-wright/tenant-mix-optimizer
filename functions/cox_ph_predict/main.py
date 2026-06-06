@@ -9,6 +9,12 @@ POST {"tenant_id": "TENANT_001"}
 Returns hazard scores (sigmoid + percentile), alert flags for the two-layer
 design, and the top 3 feature contributions with branch labels.
 
+Serving artefact: this function loads cox_serving.pkl - a lifelines-free bundle
+of plain dicts (coefficients + norm_mean + train_log_ph), NOT the full model
+object. Scoring is a centered linear predictor done with arithmetic only, so the
+serving path carries no lifelines/scipy dependency. See the train/serve
+separation note in fit_cox_model.py and decisions.md 2026-06-06.
+
 Featuriser note: the trailing-window logic in _featurise() mirrors
 fit_cox_model.py:build_counting_process. If you change window lengths or
 column names in the training script, update this function to match.
@@ -16,13 +22,13 @@ column names in the training script, update this function to match.
 
 import json
 import logging
+import math
 import os
 import pickle
 from datetime import datetime, timezone
 from pathlib import Path
 
 import functions_framework
-import numpy as np
 import pandas as pd
 from pymongo import MongoClient
 
@@ -46,23 +52,24 @@ FEATURE_META = {
     "stock_depth_3mo":       {"branch": "leading"},
 }
 
-MODEL_PATH = Path(__file__).parent / "model" / "cox_model.pkl"
+SERVING_PATH = Path(__file__).parent / "model" / "cox_serving.pkl"
 
 # ---------------------------------------------------------------------------
 # Module-level singletons — cold start pays the cost once; warm invocations
 # reuse them. Cloud Functions keeps the process alive between requests.
 # ---------------------------------------------------------------------------
 
-_bundle = None
+_serving = None
 _mongo_client = None
 
 
-def _load_bundle() -> dict:
-    global _bundle
-    if _bundle is None:
-        with open(MODEL_PATH, "rb") as f:
-            _bundle = pickle.load(f)
-    return _bundle
+def _load_serving() -> dict:
+    """Load the lifelines-free serving bundle (plain dicts/lists)."""
+    global _serving
+    if _serving is None:
+        with open(SERVING_PATH, "rb") as f:
+            _serving = pickle.load(f)
+    return _serving
 
 
 def _get_db():
@@ -134,15 +141,21 @@ def _featurise(obs: list) -> dict:
 # Score — log partial hazard → sigmoid + percentile rank
 # ---------------------------------------------------------------------------
 
-def _score(model, train_log_ph: np.ndarray, features: dict) -> tuple[float, float]:
-    X = pd.DataFrame([{f: features[f] for f in FEATURE_NAMES}])
-    log_ph = float(model.predict_log_partial_hazard(X).iloc[0])
+def _score(coefficients: dict, norm_mean: dict, train_log_ph: list,
+           features: dict) -> tuple[float, float]:
+    # Log partial hazard = CENTERED linear predictor (x - xbar) . beta. lifelines'
+    # predict_log_partial_hazard centers by the training mean, so we must too,
+    # otherwise every score drifts by the constant xbar . beta (verified by
+    # scripts/check_serving_parity.py: centered dot == lifelines to 0.0).
+    log_ph = sum(
+        coefficients[f] * (float(features[f]) - norm_mean[f]) for f in FEATURE_NAMES
+    )
 
     # Sigmoid: bounded 0-1, centre = average-risk tenant in training population
-    sigmoid = float(1.0 / (1.0 + np.exp(-log_ph)))
+    sigmoid = 1.0 / (1.0 + math.exp(-log_ph))
 
     # Percentile rank: fraction of training tenants with a lower log partial hazard
-    percentile = float((train_log_ph < log_ph).mean())
+    percentile = sum(1 for v in train_log_ph if v < log_ph) / len(train_log_ph)
 
     return sigmoid, percentile
 
@@ -151,11 +164,10 @@ def _score(model, train_log_ph: np.ndarray, features: dict) -> tuple[float, floa
 # Top features — coef × value, sorted by absolute magnitude
 # ---------------------------------------------------------------------------
 
-def _top_features(model, features: dict, n: int = 3) -> list:
-    params = model.params_
+def _top_features(coefficients: dict, features: dict, n: int = 3) -> list:
     contributions = []
     for name in FEATURE_NAMES:
-        coef = float(params.get(name, 0.0))
+        coef = float(coefficients.get(name, 0.0))
         value = float(features.get(name, 0.0))
         raw = coef * value
         contributions.append({
@@ -191,12 +203,15 @@ def cox_ph_predict(request):
                 {"Content-Type": "application/json"})
 
     try:
-        bundle = _load_bundle()
+        serving = _load_serving()
         db = _get_db()
         _, obs = _fetch(db, tenant_id)
         features = _featurise(obs)
-        sigmoid, percentile = _score(bundle["model"], bundle["train_log_ph"], features)
-        top = _top_features(bundle["model"], features)
+        sigmoid, percentile = _score(
+            serving["coefficients"], serving["norm_mean"],
+            serving["train_log_ph"], features,
+        )
+        top = _top_features(serving["coefficients"], features)
 
         payload = {
             "tenant_id": tenant_id,
