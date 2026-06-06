@@ -86,13 +86,15 @@ LEASE = {
 # Expected outcomes (the demo story we want to hold).
 EXPECT = {
     "TENANT_DEMO_001": {"base_action": "renew", "intervention": "renegotiate",
-                        "escalated_by": ["enquiry:rent_relief"], "confidence": "medium"},
+                        "escalated_by": ["enquiry:rent_relief"], "consider_replace": [],
+                        "confidence": "medium"},
     "TENANT_DEMO_002": {"base_action": "renegotiate", "intervention": "renegotiate",
-                        "escalated_by": [], "confidence": "high"},
+                        "escalated_by": [], "consider_replace": ["terms:rent_cap_binds"],
+                        "confidence": "high"},
     "TENANT_DEMO_003": {"base_action": "monitor", "intervention": "monitor",
-                        "escalated_by": [], "confidence": "high"},
+                        "escalated_by": [], "consider_replace": [], "confidence": "high"},
     "TENANT_DEMO_004": {"base_action": "monitor", "intervention": "monitor",
-                        "escalated_by": [], "confidence": "high"},
+                        "escalated_by": [], "consider_replace": [], "confidence": "high"},
 }
 
 
@@ -124,10 +126,69 @@ def check_policy_trace() -> bool:
                      f"{' CAP' if terms.get('cap_binds') else ''})" if terms else "none")
         print(f"  {'OK ' if ok else 'XX '}{tid}  base={payload.get('base_action'):<11} "
               f"final={payload.get('intervention'):<11} esc={payload.get('escalated_by')} "
-              f"conf={payload.get('confidence'):<6} terms={terms_str}")
+              f"cr={payload.get('consider_replace')} conf={payload.get('confidence'):<6} terms={terms_str}")
         if not ok:
             print(f"      expected {exp}")
     print(f"policy trace: {'PASS' if all_ok else 'FAIL'}")
+    return all_ok
+
+
+# --------------------------------------------------------------------------
+# 3. Edge cases (synthetic, not demo cast) — guard option b + the anchor path
+# --------------------------------------------------------------------------
+#
+# - TEST_DISTRESSED: a distressed credit band must floor to RENEGOTIATE (never
+#   auto-replace) and surface credit:distressed in consider_replace. Guards the
+#   2026-06-06 option-b decision against regression.
+# - TEST_ANCHOR: exercises the anchor path, which the demo cast doesn't touch.
+#   The flat single-step cut cap binds hard against an anchor's tiny occupancy
+#   ceiling -> consider_replace surfaces terms:rent_cap_binds. This is exactly
+#   the case the parked anchor-aware-cap enhancement (xprize) would relax.
+
+EDGE_HAZARD = {
+    "TEST_DISTRESSED": {"hazard_percentile": 0.30, "alert_flags": {
+        "enquiry": {"type": None, "recent_6mo": False},
+        "credit": {"band": "distressed", "notches_changed_6mo": -3, "trend_3mo_mean": -0.80}}},
+    "TEST_ANCHOR": {"hazard_percentile": 0.70, "alert_flags": {
+        "enquiry": {"type": None, "recent_6mo": False},
+        "credit": {"band": "fair", "notches_changed_6mo": 0, "trend_3mo_mean": 0.0}}},
+}
+EDGE_LEASE = {
+    "TEST_DISTRESSED": ({"category": "chain_apparel", "rent_per_sqft": 3.00,
+                         "lease_end": "2028-01-01", "is_anchor": False}, "2026-06", 0.16),
+    "TEST_ANCHOR": ({"category": "anchor_dept_store", "rent_per_sqft": 1.50,
+                     "lease_end": "2028-01-01", "is_anchor": True}, "2026-06", 0.09),
+}
+
+
+def check_edge_cases() -> bool:
+    main._get_hazard = lambda tid: EDGE_HAZARD[tid]
+    main._get_db = lambda: None
+    main._fetch_lease_state = lambda db, tid: EDGE_LEASE[tid]
+
+    checks = []  # (tid, predicate(payload), note)
+    checks.append(("TEST_DISTRESSED",
+                   lambda p: (p["intervention"] == "renegotiate"
+                              and "credit:distressed" in p["consider_replace"]),
+                   "distressed -> renegotiate (NOT replace) + consider_replace"))
+    checks.append(("TEST_ANCHOR",
+                   lambda p: (p["intervention"] == "renegotiate"
+                              and p["suggested_terms"]["cap_binds"] is True
+                              and "terms:rent_cap_binds" in p["consider_replace"]),
+                   "anchor cut cap binds -> consider_replace"))
+
+    all_ok = True
+    for tid, pred, note in checks:
+        body, status, _ = main.recommend_intervention(FakeRequest(tid))
+        payload = json.loads(body)
+        ok = status == 200 and pred(payload)
+        all_ok = all_ok and ok
+        terms = payload.get("suggested_terms")
+        terms_str = (f"rent {terms['rent_per_sqft']} (-{terms['reduction_pct']}%"
+                     f"{' CAP' if terms.get('cap_binds') else ''})" if terms else "none")
+        print(f"  {'OK ' if ok else 'XX '}{tid}  final={payload.get('intervention'):<11} "
+              f"cr={payload.get('consider_replace')} terms={terms_str}  # {note}")
+    print(f"edge cases: {'PASS' if all_ok else 'FAIL'}")
     return all_ok
 
 
@@ -136,5 +197,7 @@ if __name__ == "__main__":
     a = check_drift_guard()
     print("-" * 60)
     b = check_policy_trace()
+    print("-" * 60)
+    c = check_edge_cases()
     print("=" * 60)
-    sys.exit(0 if (a and b) else 1)
+    sys.exit(0 if (a and b and c) else 1)

@@ -19,13 +19,19 @@ DESIGN (see decisions.md 2026-06-06 "recommend_intervention design"):
 Logic (action tiers ascending: monitor < renew < renegotiate < replace):
   1. base_action from hazard_percentile + lease timing (POLICY thresholds).
   2. floor escalation from alert_flags: final = max(base_action, floor).
-       any enquiry -> renegotiate;  credit weak -> renegotiate;  distressed -> replace.
+       any enquiry -> renegotiate;  credit weak OR distressed -> renegotiate.
+       NOTE: the function NEVER auto-emits 'replace'. replace is only ever a
+       human decision (see decisions.md 2026-06-06 option b). A distressed
+       credit band floors to renegotiate AND raises consider_replace.
   3. escalated_by = the flags that raised the action ABOVE base ([] if none).
        The live alert_flags are echoed regardless, so a non-escalating flag is
        still visible.
   4. suggested_terms (renew/renegotiate) computed deterministically from the
        tenant's current lease + the category occupancy-cost ceiling, with a cap
-       on a single-step rent cut (cap_binds is itself a signal -> consider replace).
+       on a single-step rent cut.
+  5. consider_replace = explicit, auditable list of reasons a human should weigh
+       escalating to replace (the function won't do it for them): a distressed
+       credit band, and/or the rent-cut cap binding (rent alone is insufficient).
 
 Env: MONGODB_URI (secret), MONGODB_DB (default tenant_mix), COX_PH_PREDICT_URL.
 """
@@ -162,9 +168,16 @@ def _base_action(percentile: float, months_to_lease_end: int) -> str:
     return "renew"
 
 
-def _apply_floor(base: str, alert_flags: dict) -> tuple[str, list]:
-    """final = max(base, floor); escalated_by = flags that raised it above base."""
+def _apply_floor(base: str, alert_flags: dict) -> tuple[str, list, list]:
+    """final = max(base, floor); escalated_by = flags that raised it above base.
+
+    consider_replace = advisory reasons a human should weigh escalating to
+    replace. The function itself never auto-floors to replace off one signal —
+    even a distressed credit band only floors to renegotiate (see decisions.md
+    2026-06-06 option b). replace is always a human call.
+    """
     floors = []  # (floor_action, label)
+    consider_replace = []
     enq = alert_flags.get("enquiry", {})
     if enq.get("recent_6mo"):
         floors.append(("renegotiate", f"enquiry:{enq.get('type')}"))
@@ -172,7 +185,10 @@ def _apply_floor(base: str, alert_flags: dict) -> tuple[str, list]:
     if band == "weak":
         floors.append(("renegotiate", "credit:weak"))
     elif band == "distressed":
-        floors.append(("replace", "credit:distressed"))
+        # Severe, but still not an auto-replace: floor to renegotiate and flag
+        # replace for the human to weigh.
+        floors.append(("renegotiate", "credit:distressed"))
+        consider_replace.append("credit:distressed")
 
     final = base
     escalated_by = []
@@ -181,7 +197,7 @@ def _apply_floor(base: str, alert_flags: dict) -> tuple[str, list]:
             escalated_by.append(label)
         if RANK[action] > RANK[final]:
             final = action
-    return final, escalated_by
+    return final, escalated_by, consider_replace
 
 
 def _suggested_terms(intervention: str, tenant: dict, recent_rts: float | None) -> dict | None:
@@ -227,7 +243,7 @@ def _confidence(percentile: float, alert_flags: dict, escalated_by: list) -> str
     return "low"
 
 
-def _reasoning(percentile, base, final, escalated_by, terms) -> str:
+def _reasoning(percentile, base, final, escalated_by, terms, consider_replace) -> str:
     """A terse, factual, deterministic summary. The manager-agent writes the
     manager-facing prose; this is the structured fact line it narrates from."""
     parts = [f"Ambient risk percentile {percentile:.2f}; base action '{base}'."]
@@ -238,8 +254,10 @@ def _reasoning(percentile, base, final, escalated_by, terms) -> str:
     if terms and terms.get("reduction_pct"):
         msg = f"Suggested ~{terms['reduction_pct']:.0f}% rent reduction toward the category occupancy ceiling."
         if terms.get("cap_binds"):
-            msg += " Reduction capped — rent alone is insufficient; consider replace."
+            msg += " Reduction capped — rent alone is insufficient."
         parts.append(msg)
+    if consider_replace:
+        parts.append(f"Consider replace (human decision): {', '.join(consider_replace)}.")
     return " ".join(parts)
 
 
@@ -269,8 +287,10 @@ def recommend_intervention(request):
         months_to_lease_end = _months_until(now_month, tenant["lease_end"])
 
         base = _base_action(percentile, months_to_lease_end)
-        final, escalated_by = _apply_floor(base, alert_flags)
+        final, escalated_by, consider_replace = _apply_floor(base, alert_flags)
         terms = _suggested_terms(final, tenant, recent_rts)
+        if terms and terms.get("cap_binds"):
+            consider_replace.append("terms:rent_cap_binds")  # rent alone can't fix it
         confidence = _confidence(percentile, alert_flags, escalated_by)
 
         payload = {
@@ -278,12 +298,13 @@ def recommend_intervention(request):
             "intervention": final,
             "base_action": base,
             "escalated_by": escalated_by,
+            "consider_replace": consider_replace,  # human-only escalation signals
             "alert_flags": alert_flags,          # echoed so non-escalating flags stay visible
             "hazard_percentile": round(percentile, 3),
             "months_to_lease_end": months_to_lease_end,
             "suggested_terms": terms,
             "confidence": confidence,
-            "reasoning": _reasoning(percentile, base, final, escalated_by, terms),
+            "reasoning": _reasoning(percentile, base, final, escalated_by, terms, consider_replace),
             "computed_at": datetime.now(timezone.utc).isoformat(),
         }
         return (json.dumps(payload), 200, {"Content-Type": "application/json"})
