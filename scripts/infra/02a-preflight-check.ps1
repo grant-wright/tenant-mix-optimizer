@@ -14,14 +14,14 @@ $errors = 0
 
 Write-Host "=== Pre-deploy checks for cox-ph-predict ===`n"
 
-# 1. Model bundle in place
-$pkl = "functions/cox_ph_predict/model/cox_model.pkl"
+# 1. Serving bundle in place (lifelines-free cox_serving.pkl, NOT the full model)
+$pkl = "functions/cox_ph_predict/model/cox_serving.pkl"
 if (Test-Path $pkl) {
     $size = (Get-Item $pkl).Length
-    Write-Host "$PASS  Model bundle found ($pkl, $([math]::Round($size/1MB, 1)) MB)"
+    Write-Host "$PASS  Serving bundle found ($pkl, $([math]::Round($size/1KB, 1)) KB)"
 } else {
-    Write-Host "$FAIL  Model bundle missing: $pkl"
-    Write-Host "       Fix: cp data_train/cox_model.pkl functions/cox_ph_predict/model/cox_model.pkl"
+    Write-Host "$FAIL  Serving bundle missing: $pkl"
+    Write-Host "       Fix: cp data_train/cox_serving.pkl functions/cox_ph_predict/model/cox_serving.pkl"
     $errors++
 }
 
