@@ -4,8 +4,8 @@
 
 ## Dataset
 
-- Tenants: **1508**  *  exit events: **858**
-- Events per covariate (EPV): **171.6** (858 events / 5 covariates)
+- Tenants: **1508**  *  exit events: **680**
+- Events per covariate (EPV): **136.0** (680 events / 5 covariates)
 
 ## Gate summary (hard criteria)
 
@@ -14,7 +14,7 @@
 | Branch contributes: revenue | yes | PASS |
 | Branch contributes: operational | yes | PASS |
 | Branch contributes: leading | yes | PASS |
-| KM quartiles separate @12mo (log-rank p<0.01) | p=4.3e-05 | PASS |
+| KM quartiles separate @12mo (log-rank p<0.01) | p=2.0e-11 | PASS |
 
 **Overall: GO**
 
@@ -22,8 +22,8 @@
 
 Holdout, time-dependent (landmark) concordance - among tenants still at risk at the landmark month, ranked by hazard *as of* that month:
 
-- **@12 months:** c-index 0.617
-- **@24 months:** c-index 0.671
+- **@12 months:** c-index 0.671
+- **@24 months:** c-index 0.831
 
 *These reflect AMBIENT signals (rent-to-sales, sales trend, payments, trading hours, stock depth) predicting 12-24 months ahead - a deliberately hard, honest task. The round 0.70 figure in the plan was a heuristic for ordinary concordance, not a long-horizon time-dependent c-index, so we gate on genuine discrimination (quartile separation) + structural recovery (branch contribution) and report the c-index transparently. The agent's ALERT layer adds the decisive near-term signal on top of this baseline.*
 
@@ -31,11 +31,11 @@ Holdout, time-dependent (landmark) concordance - among tenants still at risk at 
 
 | covariate | branch | HR | coef | p | expected | actual | sign ok | sig (p<.05) |
 |-----------|--------|----|------|---|----------|--------|---------|-------------|
-| rts_12mo_mean | revenue | 3.359 | +1.212 | 0.0000 | + | + | yes | yes |
-| sales_trend_12mo | revenue | 0.780 | -0.249 | 0.0009 | - | - | yes | yes |
-| late_pay_count_12mo | operational | 1.017 | +0.017 | 0.0021 | + | + | yes | yes |
-| trading_shortfall_3mo | operational | 1.897 | +0.640 | 0.0000 | + | + | yes | yes |
-| stock_depth_3mo | leading | 0.518 | -0.657 | 0.0000 | - | - | yes | yes |
+| rts_12mo_mean | revenue | 5.945 | +1.783 | 0.0000 | + | + | yes | yes |
+| sales_trend_12mo | revenue | 0.720 | -0.329 | 0.0000 | - | - | yes | yes |
+| late_pay_count_12mo | operational | 1.028 | +0.028 | 0.0000 | + | + | yes | yes |
+| trading_shortfall_3mo | operational | 2.562 | +0.941 | 0.0000 | + | + | yes | yes |
+| stock_depth_3mo | leading | 0.348 | -1.057 | 0.0000 | - | - | yes | yes |
 
 ## KM by risk quartile (holdout landmark)
 
@@ -43,18 +43,18 @@ See `cox_validation_km.png`. Quartiles are computed independently at each landma
 
 | tenant | quartile @first | quartile @second |
 |--------|------------------|-------------------|
-| TENANT_009 | Q3 | Q2 |
-| TENANT_018 | Q2 | Q3 |
-| TENANT_020 | Q1 (low) | Q2 |
-| TENANT_050 | Q2 | Q1 (low) |
-| TENANT_066 | Q3 | Q4 (high) |
-| TENANT_080 | Q2 | Q3 |
-| TENANT_083 | Q3 | Q2 |
-| TENANT_088 | Q2 | Q3 |
-| TENANT_097 | Q4 (high) | Q3 |
-| TENANT_1023 | Q3 | Q4 (high) |
-| TENANT_1028 | Q3 | Q2 |
-| TENANT_1035 | Q3 | Q4 (high) |
+| ANCHOR_NORTH | Q1 (low) | Q2 |
+| TENANT_020 | Q3 | Q2 |
+| TENANT_023 | Q2 | Q1 (low) |
+| TENANT_027 | Q1 (low) | Q2 |
+| TENANT_033 | Q4 (high) | Q3 |
+| TENANT_040 | Q3 | Q4 (high) |
+| TENANT_044 | Q4 (high) | Q3 |
+| TENANT_045 | Q2 | Q3 |
+| TENANT_064 | Q3 | Q2 |
+| TENANT_079 | Q3 | Q4 (high) |
+| TENANT_1007 | Q2 | Q1 (low) |
+| TENANT_1011 | Q3 | Q2 |
 
 ## Two-layer design note
 

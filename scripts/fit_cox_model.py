@@ -15,29 +15,34 @@ each month. The counting-process form uses each tenant-month's *backward-
 looking* signal and the event only ever fires on the final interval, so there
 is no look-ahead. See the planning repo's decision log (Day 4).
 
-The covariates span the generator's four causal branches; each is computed as
-a STRICTLY trailing window at every month (no future information):
+The covariates span THREE of the generator's causal branches (revenue,
+operational, leading); each is computed as a STRICTLY trailing window at every
+month (no future information):
 
   Revenue      rts_12mo_mean         trailing-12mo mean rent-to-sales   (+)
                sales_trend_12mo      12-month sales growth              (-)
   Operational  late_pay_count_12mo   late-payment flags, trailing 12mo  (+)
                trading_shortfall_3mo trailing-3mo mean shortfall        (+)
-  Leading      enquiry_recent_6mo    any relief/exit enquiry, last 6mo  (+)
-               stock_depth_3mo       trailing-3mo mean stock depth      (-)
-  External     credit_trend_3mo_mean trailing-3mo mean credit trend     (-)
-               credit_x_corpfranch   credit trend x corp/franchise      (-)
+  Leading      stock_depth_3mo       trailing-3mo mean stock depth      (-)
 
-The model is STRATIFIED by `operator_type` (each type its own baseline hazard)
-and carries the one `operator_type x credit_trend` interaction the spec names
-(encoded as credit_trend x is-corporate-or-franchise, since the generator makes
-credit informative only for those operator types).
+The relief/exit-enquiry and credit signals are deliberately NOT covariates:
+they are discrete, high-impact event signals handled in the agent's ALERT layer
+(see the two-layer note at FEATURES below and decisions.md 2026-06-03). Keeping
+them out also removes a near-label signal, so the model's discrimination is honest.
+
+The model is STRATIFIED by `operator_type` (each type its own baseline hazard).
 
 Usage:
     python scripts/fit_cox_model.py [--seed 42] [--data data] [--holdout 0.2]
 
 Outputs:
-    data/cox_model.pkl              pickled fitted model (gitignored; for the
-                                    cox_ph_predict Cloud Function, Day 5)
+    data/cox_model.pkl              full bundle: fitted model + train log-ph +
+                                    serving coefficients (gitignored; for
+                                    retraining / inspection)
+    data/cox_serving.pkl            lifelines-free SERVING artefact - plain dicts
+                                    (coefficients + centering + train log-ph) for
+                                    the cox_ph_predict Cloud Function. See the
+                                    train/serve separation note at the bundle save.
     docs/cox_validation_km.png      landmark KM-by-risk-quartile plots (evidence)
     docs/cox_validation_report.md   the go/no-go gate report (evidence)
 """
@@ -120,15 +125,13 @@ def build_counting_process(tenants, observations):
         lambda s: s.astype(int).rolling(6, min_periods=1).max())
     odf["stock_depth_3mo"] = grp["stock_depth_index"].transform(
         lambda s: s.rolling(3, min_periods=1).mean())
+    # Ambient credit-trend signal, kept as an alert-layer reference column (see
+    # the note above build_counting_process). NOT a model covariate.
     odf["credit_trend_3mo_mean"] = grp["credit_trend_3mo"].transform(
         lambda s: s.rolling(3, min_periods=1).mean())
     # 12-month sales growth; 0 where <12mo of history (trend not yet knowable).
     odf["sales_trend_12mo"] = grp["sales_total"].transform(
         lambda s: (s / s.shift(12) - 1.0)).fillna(0.0)
-
-    # Interaction: credit only carries signal for corporate/franchise tenants.
-    is_corp_franch = odf["operator_type"].isin(["corporate", "franchise"]).astype(int)
-    odf["credit_x_corpfranch"] = odf["credit_trend_3mo_mean"] * is_corp_franch
 
     # Event fires only on an exiter's final observed interval.
     last_idx = odf.groupby("tenant_id")["month_idx"].transform("max")
@@ -385,15 +388,51 @@ def main(seed=42, data_dir="data", holdout_frac=0.2, penalizer=0.1):
                  gate_landmark=gate_landmark, km_separates=km_separates,
                  overall=overall, movers=movers)
 
-    # Save a model bundle rather than the bare model: the Cloud Function needs
-    # the training population's log partial hazard distribution to compute a
-    # percentile-rank score alongside the sigmoid score (belt-and-braces).
-    # We use each tenant's LAST training observation (current state at exit/censor).
+    # --- Train/serve artefact separation (see decisions.md 2026-06-06) ---
+    # We persist TWO artefacts from one fit:
+    #
+    #   cox_model.pkl    the TRAINING artefact - the full lifelines model object,
+    #                    for retraining, inspection, and validation diagnostics.
+    #                    Unpickling it REQUIRES lifelines installed.
+    #
+    #   cox_serving.pkl  the SERVING artefact - plain Python types only, no
+    #                    lifelines classes, so it unpickles with zero lifelines
+    #                    dependency. Scoring a tenant is just a centered linear
+    #                    predictor, so all the Cloud Function needs is:
+    #                      coefficients  beta per covariate
+    #                      norm_mean     the training mean per covariate; lifelines'
+    #                                    predict_log_partial_hazard returns the
+    #                                    CENTERED dot product (x - xbar) . beta, so
+    #                                    the serving path must subtract xbar too or
+    #                                    every score drifts by a constant.
+    #                      train_log_ph  the training population's log-partial-hazard
+    #                                    distribution, for the percentile-rank score.
+    #
+    # The percentile (belt-and-braces alongside the sigmoid) ranks a tenant against
+    # each TRAINING tenant's LAST observation (current state at exit/censor).
     last_train = train_df.loc[train_df.groupby("tenant_id")["stop"].idxmax()]
     train_log_ph = model.predict_log_partial_hazard(last_train[FEATURE_NAMES]).values
-    bundle = {"model": model, "train_log_ph": train_log_ph}
+
+    coefficients = {f: float(model.params_[f]) for f in FEATURE_NAMES}
+    norm_mean = {f: float(model._norm_mean[f]) for f in FEATURE_NAMES}
+
+    bundle = {
+        "model": model,
+        "train_log_ph": train_log_ph,
+        "coefficients": coefficients,   # also kept here so the full bundle self-describes
+        "norm_mean": norm_mean,
+    }
     with open(data / "cox_model.pkl", "wb") as fh:
         pickle.dump(bundle, fh)
+
+    serving = {
+        "coefficients": coefficients,
+        "norm_mean": norm_mean,
+        "train_log_ph": [float(v) for v in train_log_ph],
+        "feature_names": list(FEATURE_NAMES),
+    }
+    with open(data / "cox_serving.pkl", "wb") as fh:
+        pickle.dump(serving, fh)
 
     # Console gate summary
     print("\n" + "=" * 72)
@@ -413,7 +452,7 @@ def main(seed=42, data_dir="data", holdout_frac=0.2, penalizer=0.1):
         print(f"    @{L}mo c-index = {landmark_c[L]:.3f}")
     print("\n" + ("OVERALL: GO" if overall else "OVERALL: NO-GO (review)"))
     print(f"\nArtifacts: docs/cox_validation_km.png, docs/cox_validation_report.md, "
-          f"{data}/cox_model.pkl")
+          f"{data}/cox_model.pkl (training), {data}/cox_serving.pkl (serving)")
     print("=" * 72)
 
     return overall
