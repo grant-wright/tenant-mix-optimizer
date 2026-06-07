@@ -3,10 +3,10 @@
 # Pre-deploy checks for the agent-tools MCP server (Cloud Run).
 #
 # This server is a thin MCP proxy in front of our custom Cloud Functions. v1
-# proxies recommend-intervention, so this preflight confirms that function is
-# live and captures its URL (injected as RECOMMEND_INTERVENTION_URL at deploy).
-# Also confirms the Cloud Run API is enabled (Functions used it indirectly, but
-# we deploy a Run service directly here).
+# proxies query-tenants + recommend-intervention, so this preflight confirms
+# BOTH functions are live and captures their URLs (injected as QUERY_TENANTS_URL
+# and RECOMMEND_INTERVENTION_URL at deploy). Also confirms the Cloud Run API is
+# enabled (Functions used it indirectly, but we deploy a Run service directly here).
 #
 # Run before 04b-deploy-mcp.ps1. Fix any FAIL items before proceeding.
 # Expected duration: ~10-20s. Date: 2026-06-07
@@ -54,6 +54,19 @@ if ($LASTEXITCODE -eq 0 -and $REC_URL -match "^https://") {
     Write-Host "       RECOMMEND_INTERVENTION_URL = $REC_URL"
 } else {
     Write-Host "$FAIL  recommend-intervention not found — deploy it first (03b-deploy-recommend.ps1)"
+    Write-Host "       The MCP server proxies to it and cannot serve the tool without it."
+    $errors++
+}
+
+# 4. Dependency — query-tenants is deployed and we can read its URL
+$QRY_URL = gcloud functions describe query-tenants `
+    --gen2 --region=$REGION --project=$PROJECT_ID `
+    --format="value(serviceConfig.uri)" 2>&1
+if ($LASTEXITCODE -eq 0 -and $QRY_URL -match "^https://") {
+    Write-Host "$PASS  Dependency query-tenants is deployed"
+    Write-Host "       QUERY_TENANTS_URL = $QRY_URL"
+} else {
+    Write-Host "$FAIL  query-tenants not found — deploy it first (05b-deploy-query.ps1)"
     Write-Host "       The MCP server proxies to it and cannot serve the tool without it."
     $errors++
 }
