@@ -53,6 +53,13 @@ COLLECTIONS = {
                 "status":     {"bsonType": "string",
                                "enum": ["active", "exited"]},
                 "exit_date":  {"bsonType": ["string", "null"]},
+                # Precomputed by scripts/precompute_hazard.py (= cox_ph_predict
+                # hazard_percentile as of the last run). Read by query_tenants to
+                # rank the at-risk list without scoring live. Optional: a tenant
+                # not yet scored simply has no current_hazard. See decisions.md
+                # 2026-06-07.
+                "current_hazard":     {"bsonType": ["double", "null"]},
+                "hazard_computed_at": {"bsonType": ["string", "null"]},
             },
         }
     },
