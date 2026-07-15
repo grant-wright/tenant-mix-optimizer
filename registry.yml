@@ -1,0 +1,16 @@
+# registry.yml — this repo's declaration to the doc-type validator (L1) and reindexer (L2).
+# See atlas/types.md for what this file is for and atlas/registry.yml for a worked example.
+
+repo: tenant-mix-optimizer
+aliases: []
+
+# Home files — where each object type may be DECLARED (DEC-24).
+#
+# This is a code repo (ML pipeline / Cloud Functions), not a docs-driven one like its siblings —
+# only 3 markdown files exist (README.md x2, docs/cox_validation_report.md), none of them a
+# decisions/deferrals/compromises/issues register. Verified against disk, not assumed: all null.
+home_files:
+  DEC: null
+  DEF: null           # deferrals live in atlas only (cross-repo by nature)
+  CMP: null
+  ISS: null           # lives in projects-toolkit/issues-and-fixes.md
